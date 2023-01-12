@@ -12,11 +12,6 @@ keywords = ["read", "password", "security", "pass", "getpass"]
 edition = "2018"
 rust-version = "1.60"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["std", "winnt", "fileapi", "processenv", "winbase", "handleapi", "consoleapi", "minwindef", "wincon"] }
-
 [dependencies]
-rtoolbox = { path = "../rtoolbox", version = "0.0" }
+libc = "0.2"
+zeroize = "1.5.7"
