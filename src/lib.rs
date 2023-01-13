@@ -12,50 +12,44 @@
 //! use zeroize::Zeroize;
 //! password.zeroize();
 //! ```
+//! 
+//! With prompt, retry and securely consume the password:
+//! ```rust
+//! use std::io::{Error, ErrorKind};
+//! let res = rpassword::ask_password("Enter your password:", |password: &str| {
+//!     // consume your password here, and make sure the code SHALL NOT PANIC here!
+
+//!     if password.isEmpty() { // if password is wrong, return PermissionDenied to tell user to try again
+//!         println!("Wrong password, please try again.");
+//!         // This will cause password to be ask again automatically, and the wrong one will be securely zeroize too.
+//!         Err(Error::from(ErrorKind::PermissionDenied)) 
+//!     }
+
+//!     Ok(()) // You can return any other thing you need other than the unit type ().
+//! });
+//! //Password has already securely zeroized here, no matter whether it is wrong or not, if nothing panic above.
+
+//! match res {
+//!     // if user has retried for 3 times, ask_password will not continue retrying and return this error.
+//!     Err(error) if error.kind() == ErrorKind::PermissionDenied => { 
+//!         panic!(); // now you can panic!() if needed.
+//!     },
+//!     Err(error) => {
+//!         // Any other error will cause ask_password to exit without retry.
+//!     }
+//!     _ => {}
+//! };
+//! ```
 
 use zeroize::Zeroize;
 
 #[cfg(target_family = "unix")]
 mod unix {
     use libc::{c_int, tcsetattr, termios, ECHO, ECHONL, TCSANOW};
-    use std::io::{self, BufRead};
+    use zeroize::Zeroize;
+    use std::io::{self, BufRead, Write, Error, ErrorKind};
     use std::mem;
     use std::os::unix::io::AsRawFd;
-
-    struct HiddenInput {
-        fd: i32,
-        term_orig: termios,
-    }
-
-    impl HiddenInput {
-        fn new(fd: i32) -> io::Result<HiddenInput> {
-            // Make two copies of the terminal settings. The first one will be modified
-            // and the second one will act as a backup for when we want to set the
-            // terminal back to its original state.
-            let mut term = safe_tcgetattr(fd)?;
-            let term_orig = safe_tcgetattr(fd)?;
-
-            // Hide the password. This is what makes this function useful.
-            term.c_lflag &= !ECHO;
-
-            // But don't hide the NL character when the user hits ENTER.
-            term.c_lflag |= ECHONL;
-
-            // Save the settings for now.
-            io_result(unsafe { tcsetattr(fd, TCSANOW, &term) })?;
-
-            Ok(HiddenInput { fd, term_orig })
-        }
-    }
-
-    impl Drop for HiddenInput {
-        fn drop(&mut self) {
-            // Set the the mode back to normal
-            unsafe {
-                tcsetattr(self.fd, TCSANOW, &self.term_orig);
-            }
-        }
-    }
 
     /// Turns a C function return into an IO Result
     fn io_result(ret: c_int) -> std::io::Result<()> {
@@ -77,35 +71,65 @@ mod unix {
         let fd = tty.as_raw_fd();
         let mut reader = io::BufReader::new(tty);
 
-        read_password_from_fd_with_hidden_input(&mut reader, fd)
-    }
-
-    /// Reads a password from a given file descriptor
-    fn read_password_from_fd_with_hidden_input(
-        reader: &mut impl BufRead,
-        fd: i32,
-    ) -> std::io::Result<String> {
         let mut password = String::new();
 
-        let hidden_input = HiddenInput::new(fd)?;
+        // Make two copies of the terminal settings. The first one will be modified
+        // and the second one will act as a backup for when we want to set the
+        // terminal back to its original state.
+        let mut term = safe_tcgetattr(fd)?;
+        let term_orig = safe_tcgetattr(fd)?;
+
+        // Hide the password. This is what makes this function useful.
+        term.c_lflag &= !ECHO;
+
+        // But don't hide the NL character when the user hits ENTER.
+        term.c_lflag |= ECHONL;
+
+        // Save the settings for now.
+        io_result(unsafe { tcsetattr(fd, TCSANOW, &term) })?;
 
         reader.read_line(&mut password)?;
 
-        std::mem::drop(hidden_input);
+        // Set the the mode back to normal
+        unsafe { tcsetattr(fd, TCSANOW, &term_orig); }
 
         super::fix_line_issues(password)
+    }
+
+    pub fn ask_password<F, T>(prompt: &str, consume: F) -> Result<T, Error>
+    where 
+        F: Fn(&str) -> Result<T, Error>,
+    {
+        for _ in 0..3 {
+            print!("{}", prompt);
+            std::io::stdout().flush().ok();
+            let read_result = read_password();
+            match read_result {
+                Ok(mut password) => {
+                    let res = consume(&password);
+                    password.zeroize();
+                    match res {
+                        Err(error) if error.kind() == ErrorKind::PermissionDenied => continue,
+                        _ => {},
+                    }
+                    return res;
+                },
+                Err(_) => {continue;}
+            }
+        }
+        return Err(Error::from(ErrorKind::PermissionDenied));
     }
 }
 
 #[cfg(target_family = "unix")]
-pub use unix::read_password;
+pub use unix::*;
 
 /// Normalizes the return of `read_line()` in the context of a CLI application
 pub fn fix_line_issues(mut line: String) -> std::io::Result<String> {
     if !line.ends_with('\n') {
-        return Err(std::io::Error::new(
+        line.zeroize();
+        return Err(std::io::Error::from(
             std::io::ErrorKind::UnexpectedEof,
-            "unexpected end of file",
         ));
     }
 
@@ -116,16 +140,6 @@ pub fn fix_line_issues(mut line: String) -> std::io::Result<String> {
     if line.ends_with('\r') {
         line.pop();
     }
-
-    // Ctrl-U should remove the line in terminals
-    line = match line.rfind('\u{15}') {
-        Some(last_ctrl_u_index) => {
-            let newline = line[last_ctrl_u_index + 1..].to_string();
-            line.zeroize();
-            newline
-        },
-        None => line,
-    };
 
     Ok(line)
 }
